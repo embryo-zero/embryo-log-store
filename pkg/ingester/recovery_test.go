@@ -1,0 +1,419 @@
+package ingester
+
+import (
+	"context"
+	"fmt"
+	"runtime"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/go-kit/log"
+	"github.com/grafana/dskit/user"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/tsdb/record"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/grafana/loki/v3/pkg/distributor/writefailures"
+	"github.com/grafana/loki/v3/pkg/ingester/client"
+	"github.com/grafana/loki/v3/pkg/ingester/wal"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/querier/testutil"
+	loki_runtime "github.com/grafana/loki/v3/pkg/runtime"
+	"github.com/grafana/loki/v3/pkg/storage/chunk"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	"github.com/grafana/loki/v3/pkg/validation"
+)
+
+type MemoryWALReader struct {
+	xs [][]byte
+
+	initialized bool
+}
+
+func (m *MemoryWALReader) Next() bool {
+	if len(m.xs) < 1 {
+		return false
+	}
+
+	// don't advance on the first call
+	if !m.initialized {
+		m.initialized = true
+		return true
+	}
+
+	m.xs = m.xs[1:]
+	return len(m.xs) > 0
+}
+
+func (m *MemoryWALReader) Err() error { return nil }
+
+func (m *MemoryWALReader) Record() []byte { return m.xs[0] }
+
+func buildMemoryReader(users, totalStreams, entriesPerStream int, withStructuredMetadata bool) (*MemoryWALReader, []*wal.Record) {
+	var recs []*wal.Record
+	reader := &MemoryWALReader{}
+	for i := 0; i < totalStreams; i++ {
+		user := fmt.Sprintf("%d", i%users)
+		recs = append(recs, &wal.Record{
+			UserID: user,
+			Series: []record.RefSeries{
+				{
+					Ref: chunks.HeadSeriesRef(i),
+					Labels: labels.FromMap(
+						map[string]string{
+							"stream": fmt.Sprint(i),
+							"user":   user,
+						},
+					),
+				},
+			},
+		})
+
+		var entries []logproto.Entry
+		for j := 0; j < entriesPerStream; j++ {
+			entry := logproto.Entry{
+				Timestamp: time.Unix(int64(j), 0),
+				Line:      fmt.Sprintf("%d", j),
+			}
+
+			if withStructuredMetadata {
+				entry.StructuredMetadata = logproto.FromLabelsToLabelAdapters(labels.FromStrings(
+					"traceID", strings.Repeat(fmt.Sprintf("%d", j), 10),
+					"userID", strings.Repeat(fmt.Sprintf("%d", j), 10),
+				))
+			}
+
+			entries = append(entries, entry)
+		}
+		recs = append(recs, &wal.Record{
+			UserID: user,
+			RefEntries: []wal.RefEntries{
+				{
+					Ref:     chunks.HeadSeriesRef(i),
+					Entries: entries,
+				},
+			},
+		})
+	}
+
+	for _, rec := range recs {
+		if len(rec.Series) > 0 {
+			reader.xs = append(reader.xs, rec.EncodeSeries(nil))
+		}
+
+		if len(rec.RefEntries) > 0 {
+			reader.xs = append(reader.xs, rec.EncodeEntries(wal.CurrentEntriesRec, nil))
+		}
+	}
+
+	return reader, recs
+}
+
+type MemRecoverer struct {
+	users map[string]map[chunks.HeadSeriesRef][]logproto.Entry
+	done  chan struct{}
+
+	sync.Mutex
+	usersCt, streamsCt, seriesCt int
+}
+
+func NewMemRecoverer() *MemRecoverer {
+	return &MemRecoverer{
+		users: make(map[string]map[chunks.HeadSeriesRef][]logproto.Entry),
+		done:  make(chan struct{}),
+	}
+}
+
+func (r *MemRecoverer) NumWorkers() int { return runtime.GOMAXPROCS(0) }
+
+func (r *MemRecoverer) Series(_ *Series) error { return nil }
+
+func (r *MemRecoverer) SetStream(_ context.Context, userID string, series record.RefSeries) error {
+	r.Lock()
+	defer r.Unlock()
+	user, ok := r.users[userID]
+	if !ok {
+		user = make(map[chunks.HeadSeriesRef][]logproto.Entry)
+		r.users[userID] = user
+		r.usersCt++
+	}
+
+	if _, exists := user[series.Ref]; exists {
+		return fmt.Errorf("stream (%d) already exists for user (%s)", series.Ref, userID)
+	}
+
+	user[series.Ref] = make([]logproto.Entry, 0)
+	r.streamsCt++
+	return nil
+}
+
+func (r *MemRecoverer) Push(userID string, _ time.Time, entries wal.RefEntries) error {
+	r.Lock()
+	defer r.Unlock()
+
+	user, ok := r.users[userID]
+	if !ok {
+		return fmt.Errorf("unexpected user access (%s)", userID)
+	}
+
+	stream, ok := user[entries.Ref]
+	if !ok {
+		return fmt.Errorf("unexpected stream access")
+	}
+
+	r.seriesCt += len(entries.Entries)
+	user[entries.Ref] = append(stream, entries.Entries...)
+	return nil
+}
+
+func (r *MemRecoverer) Close() { close(r.done) }
+
+func (r *MemRecoverer) Done() <-chan struct{} { return r.done }
+
+func Test_InMemorySegmentRecover(t *testing.T) {
+	for _, withStructuredMetadata := range []bool{true, false} {
+		t.Run(fmt.Sprintf("structuredMetadata=%t", withStructuredMetadata), func(t *testing.T) {
+			var (
+				users            = 10
+				streamsCt        = 1000
+				entriesPerStream = 50
+			)
+
+			// TODO: remove once we set v3 as current
+			if wal.CurrentEntriesRec < wal.WALRecordEntriesV3 {
+				withStructuredMetadata = false
+			}
+			reader, recs := buildMemoryReader(users, streamsCt, entriesPerStream, withStructuredMetadata)
+
+			recoverer := NewMemRecoverer()
+
+			require.NoError(t, RecoverWAL(context.Background(), reader, recoverer))
+			recoverer.Close()
+
+			require.Equal(t, users, recoverer.usersCt)
+			require.Equal(t, streamsCt, recoverer.streamsCt)
+			require.Equal(t, streamsCt*entriesPerStream, recoverer.seriesCt)
+
+			for _, rec := range recs {
+				user, ok := recoverer.users[rec.UserID]
+				require.Equal(t, true, ok)
+
+				for _, s := range rec.Series {
+					_, ok := user[s.Ref]
+					require.Equal(t, true, ok)
+				}
+
+				for _, entries := range rec.RefEntries {
+					stream, ok := user[entries.Ref]
+					require.Equal(t, true, ok)
+
+					for i, entry := range entries.Entries {
+						require.Equal(t, entry, stream[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestSeriesRecoveryNoDuplicates(t *testing.T) {
+	ingesterConfig := defaultIngesterTestConfig(t)
+	limits, err := validation.NewOverrides(defaultLimitsTestConfig(), nil)
+	require.NoError(t, err)
+
+	store := &mockStore{
+		chunks: map[string][]chunk.Chunk{},
+	}
+
+	readRingMock := mockReadRingWithOneActiveIngester()
+
+	i, err := New(ingesterConfig, client.Config{}, store, limits, loki_runtime.DefaultTenantConfigs(), nil, writefailures.Cfg{}, constants.Loki, log.NewNopLogger(), nil, readRingMock, nil)
+	require.NoError(t, err)
+
+	mkSample := func(i int) *logproto.PushRequest {
+		return &logproto.PushRequest{
+			Streams: []logproto.Stream{
+				{
+					// Note: must use normalized labels here b/c we expect them
+					// sorted but use a string for efficiency.
+					Labels: `{bar="baz1", foo="bar"}`,
+					Entries: []logproto.Entry{
+						{
+							Timestamp: time.Unix(int64(i), 0),
+							Line:      fmt.Sprintf("line %d", i),
+						},
+					},
+				},
+			},
+		}
+	}
+
+	req := mkSample(1)
+
+	ctx := user.InjectOrgID(context.Background(), "test")
+	_, err = i.Push(ctx, req)
+	require.NoError(t, err)
+
+	iter := newIngesterSeriesIter(i).Iter()
+	require.Equal(t, true, iter.Next())
+
+	series := iter.Stream()
+	require.Equal(t, false, iter.Next())
+
+	// create a new ingester now
+	i, err = New(ingesterConfig, client.Config{}, store, limits, loki_runtime.DefaultTenantConfigs(), nil, writefailures.Cfg{}, constants.Loki, log.NewNopLogger(), nil, readRingMock, nil)
+	require.NoError(t, err)
+
+	// recover the checkpointed series
+	recoverer := newIngesterRecoverer(i)
+	require.NoError(t, recoverer.Series(series))
+
+	_, err = i.Push(ctx, req)
+	require.NoError(t, err) // we don't error on duplicate pushes
+
+	result := mockQuerierServer{
+		ctx: ctx,
+	}
+
+	// ensure no duplicate log lines exist
+	err = i.Query(&logproto.QueryRequest{
+		Selector: `{foo="bar",bar="baz1"}`,
+		Limit:    100,
+		Start:    time.Unix(0, 0),
+		End:      time.Unix(10, 0),
+		Plan:     testutil.MustPlan(`{foo="bar",bar="baz1"}`),
+	}, &result)
+	require.NoError(t, err)
+	// We always send an empty batch to make sure stats are sent, so there will always be one empty response.
+	require.Len(t, result.resps, 2)
+	lbls := labels.FromStrings("bar", "baz1", "foo", "bar")
+	expected := []logproto.Stream{
+		{
+			Labels: lbls.String(),
+			Entries: []logproto.Entry{
+				{
+					Timestamp:          time.Unix(1, 0),
+					Line:               "line 1",
+					StructuredMetadata: logproto.EmptyLabelAdapters(),
+					Parsed:             logproto.EmptyLabelAdapters(),
+				},
+			},
+			Hash: labels.StableHash(lbls),
+		},
+	}
+	require.Equal(t, expected, result.resps[0].Streams)
+}
+
+func TestRecoveryWritesContinuesEntryCountAfterWALReplay(t *testing.T) {
+	ingesterConfig := defaultIngesterTestConfig(t)
+	limits, err := validation.NewOverrides(defaultLimitsTestConfig(), nil)
+	require.NoError(t, err)
+
+	store := &mockStore{
+		chunks: map[string][]chunk.Chunk{},
+	}
+
+	readRingMock := mockReadRingWithOneActiveIngester()
+
+	i, err := New(ingesterConfig, client.Config{}, store, limits, loki_runtime.DefaultTenantConfigs(), nil, writefailures.Cfg{}, constants.Loki, log.NewNopLogger(), nil, readRingMock, nil)
+	require.NoError(t, err)
+
+	var (
+		users            = 10
+		streamsCt        = 1000
+		entriesPerStream = 50
+	)
+
+	reader, _ := buildMemoryReader(users, streamsCt, entriesPerStream, true)
+
+	recoverer := newIngesterRecoverer(i)
+
+	err = RecoverWAL(context.Background(), reader, recoverer)
+	require.NoError(t, err)
+
+	recoverer.Close()
+
+	// Check that the entry count continues counting from the last WAL entry to avoid overwriting existing entries in the WAL on future replays.
+	for _, inst := range i.getInstances() {
+		err := inst.forAllStreams(context.Background(), func(s *stream) error {
+			assert.Equal(t, int64(entriesPerStream), s.entryCt)
+			return nil
+		})
+		require.NoError(t, err)
+	}
+}
+
+// The timestamp of the record the entries were ingested from is restored on WAL replay, so a chunk
+// that was open during a restart ends up with the same highest record timestamp as before. With
+// V4 records disabled, the entries still replay but their timestamps are ignored.
+func TestRecoveryRestoresRecordTimestampFromWAL(t *testing.T) {
+	var (
+		first  = time.UnixMilli(1_700_000_000_000)
+		second = first.Add(time.Hour)
+		lbls   = labels.FromStrings("app", "foo")
+	)
+
+	series := &wal.Record{
+		UserID: "test",
+		Series: []record.RefSeries{{Ref: 1, Labels: lbls}},
+	}
+	entries := func(version wal.RecordType, counter int64, ts time.Time, line string) []byte {
+		rec := &wal.Record{}
+		rec.Reset()
+		rec.UserID = "test"
+		rec.IngestedAt = ts
+		rec.AddEntries(1, counter, logproto.Entry{Timestamp: time.Unix(counter, 0), Line: line})
+		return rec.EncodeEntries(version, nil)
+	}
+
+	for _, tc := range []struct {
+		desc    string
+		enabled bool
+		want    time.Time
+	}{
+		{desc: "enabled", enabled: true, want: second},
+		{desc: "disabled", enabled: false, want: time.Time{}},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			limits, err := validation.NewOverrides(defaultLimitsTestConfig(), nil)
+			require.NoError(t, err)
+
+			cfg := defaultIngesterTestConfig(t)
+			cfg.WAL.RecordV4Enabled = tc.enabled
+			i, err := New(cfg, client.Config{}, &mockStore{chunks: map[string][]chunk.Chunk{}}, limits, loki_runtime.DefaultTenantConfigs(), nil, writefailures.Cfg{}, constants.Loki, log.NewNopLogger(), nil, mockReadRingWithOneActiveIngester(), nil)
+			require.NoError(t, err)
+
+			// The records arrive out of order of their timestamps, the highest one wins.
+			reader := &MemoryWALReader{xs: [][]byte{
+				series.EncodeSeries(nil),
+				entries(wal.WALRecordEntriesV4, 1, second, "a"),
+				entries(wal.WALRecordEntriesV4, 2, first, "b"),
+				// A record without a timestamp doesn't change it.
+				entries(wal.WALRecordEntriesV4, 3, time.Time{}, "c"),
+				// Neither does a record written by an older version, which can't store the timestamp.
+				entries(wal.WALRecordEntriesV3, 4, second.Add(time.Hour), "d"),
+			}}
+
+			recoverer := newIngesterRecoverer(i)
+			require.NoError(t, RecoverWAL(context.Background(), reader, recoverer))
+			recoverer.Close()
+
+			var chunks []*chunkDesc
+			for _, inst := range i.getInstances() {
+				require.NoError(t, inst.forAllStreams(context.Background(), func(s *stream) error {
+					for j := range s.chunks {
+						chunks = append(chunks, &s.chunks[j])
+					}
+					return nil
+				}))
+			}
+			require.Len(t, chunks, 1)
+			require.Equal(t, 4, chunks[0].chunk.Size())
+			require.True(t, tc.want.Equal(chunks[0].ingestedAt), "got %s, want %s", chunks[0].ingestedAt, tc.want)
+		})
+	}
+}

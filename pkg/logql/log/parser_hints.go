@@ -1,0 +1,312 @@
+package log
+
+import (
+	"bytes"
+	"fmt"
+	"strings"
+)
+
+func NoParserHints() ParserHint {
+	return &ParserHints{}
+}
+
+// ParserHint are hints given to LogQL parsers about which label keys to extract.
+// This is specially useful for parser that extract implicitly all possible label keys.
+// This is used only within metric queries since it's rare that you need all label keys.
+// For example in the following expression:
+//
+//	sum by (status_code) (rate({app="foo"} | json [5m]))
+//
+// All we need to extract is the status_code in the json parser.
+type ParserHint interface {
+	// Extracted returns whether a key has already been extracted by a previous
+	// parse stage. This result must not be cached.
+	Extracted(key string) bool
+
+	// Tells if a label with the given key should be extracted. Parsers may cache
+	// the result of ShouldExtract, so implementations of houldExtract must
+	// return consistent results for any log line or parser stage.
+	ShouldExtract(key string) bool
+
+	// Tells if there's any hint that start with the given prefix.
+	// This allows to speed up key searching in nested structured like json.
+	ShouldExtractPrefix(prefix string) bool
+
+	// Tells if we should not extract any labels.
+	// For example in :
+	//		 sum(rate({app="foo"} | json [5m]))
+	// We don't need to extract any labels from the log line.
+	NoLabels() bool
+
+	// Holds state about what's already been extracted for the associated
+	// labels. This assumes that only required labels are ever extracted
+	RecordExtracted(string)
+
+	// Returns true if all the required labels have already been extracted
+	AllRequiredExtracted() bool
+
+	// Resets the state of extracted labels
+	Reset()
+}
+
+// LabelFilterHints let a parser avoid work on a line that a label filter
+// positioned later in the pipeline would throw away. The parser can skip a
+// line that cannot pass the filter without parsing it, or stop parsing a
+// line once a label it just extracted already fails the filter.
+type LabelFilterHints interface {
+	// ShouldContinueParsingLine returns true when there is no label matcher for the
+	// provided label or the passed label and value match what's in the pipeline
+	ShouldContinueParsingLine(labelName string, lbs *LabelsBuilder) bool
+
+	// ShouldParseLine returns false when the line cannot pass the label filters after the parser,
+	// because it does not contain the values the parser would read their labels from. It returns
+	// true when there are no requirements, and when the label is already set by the stream,
+	// structured metadata or an earlier stage. The parser drops a line that it returns false for
+	// without parsing it.
+	ShouldParseLine(line []byte, lbs *LabelsBuilder) bool
+}
+
+type ParserHints struct {
+	noLabels       bool
+	requiredLabels []string
+	extracted      map[string]struct{}
+}
+
+func (p *ParserHints) Extracted(key string) bool {
+	_, ok := p.extracted[key] // It's safe to read from a nil map.
+	return ok
+}
+
+func (p *ParserHints) ShouldExtract(key string) bool {
+	// The result of ShouldExtract gets cached in parser stages, so we must
+	// return consistent results throughout the lifetime of a query; this means
+	// we can't account for p.extracted here.
+
+	for _, l := range p.requiredLabels {
+		if l == key {
+			return true
+		}
+	}
+
+	return len(p.requiredLabels) == 0
+}
+
+func (p *ParserHints) ShouldExtractPrefix(prefix string) bool {
+	if len(p.requiredLabels) == 0 {
+		return true
+	}
+	for _, l := range p.requiredLabels {
+		if strings.HasPrefix(l, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (p *ParserHints) NoLabels() bool {
+	return p.noLabels || p.AllRequiredExtracted()
+}
+
+func (p *ParserHints) RecordExtracted(key string) {
+	if p.extracted == nil {
+		p.extracted = make(map[string]struct{})
+	}
+	p.extracted[key] = struct{}{}
+}
+
+func (p *ParserHints) AllRequiredExtracted() bool {
+	if len(p.requiredLabels) == 0 || len(p.extracted) < len(p.requiredLabels) {
+		return false
+	}
+
+	found := 0
+	for _, l := range p.requiredLabels {
+		if p.Extracted(l) {
+			found++
+		}
+	}
+
+	return len(p.requiredLabels) == found
+}
+
+func (p *ParserHints) Reset() {
+	clear(p.extracted)
+}
+
+// NewParserHint creates the hints that tell the parsers of a query which labels to extract. They
+// name the labels that later stages read, the grouping labels and the metric label.
+func NewParserHint(stages Stages, groups []string, without, noLabels bool, metricLabelName string) *ParserHints {
+	requiredLabelNames := stages.RequiredLabelNamesForParsers()
+	hints := make([]string, 0, 2*(len(requiredLabelNames)+len(groups)+1))
+	hints = appendLabelHints(hints, requiredLabelNames...)
+	hints = appendLabelHints(hints, groups...)
+	hints = appendLabelHints(hints, metricLabelName)
+	hints = uniqueString(hints)
+
+	extracted := make(map[string]struct{}, len(hints))
+	if noLabels {
+		if len(hints) > 0 {
+			return &ParserHints{requiredLabels: hints, extracted: extracted}
+		}
+		return &ParserHints{noLabels: true}
+	}
+
+	// we don't know what is required when a without clause is used.
+	// Same is true when there's no grouping.
+	// no hints available then.
+	if without || len(groups) == 0 {
+		return &ParserHints{}
+	}
+
+	return &ParserHints{requiredLabels: hints, extracted: extracted}
+}
+
+// appendLabelHints Appends the label to the list of hints with and without the duplicate suffix.
+// If a parsed label collides with a stream label we add the `_extracted` suffix to it, however hints
+// are used by the parsers before we know they will collide with a stream label and hence before the
+// _extracted suffix is added. Therefore we must strip the _extracted suffix from any required labels
+// that were parsed from somewhere in the query, say in a filter or an aggregation clause.
+// Because it's possible for a valid json or logfmt key to already end with _extracted, we'll just
+// leave the existing entry ending with _extracted but also add a version with the suffix removed.
+func appendLabelHints(dst []string, src ...string) []string {
+	for _, l := range src {
+		dst = append(dst, l)
+		if strings.HasSuffix(l, DuplicateSuffix) {
+			dst = append(dst, strings.TrimSuffix(l, DuplicateSuffix))
+		}
+	}
+	return dst
+}
+
+// NoLabelFilterHints returns a LabelFilterHints that never short-circuits.
+func NoLabelFilterHints() LabelFilterHints {
+	return &labelFilterHints{}
+}
+
+type labelFilterHints struct {
+	// Save the names next to the filters to avoid an alloc when f.RequiredLabelNames() is called
+	labelFilters []LabelFilterer
+	labelNames   []string
+
+	// lineRequirements are what ShouldParseLine checks. They are independent of labelFilters, and a
+	// filter on more than one label can still contribute one. They stop at the first stage that can
+	// modify labels, like labelFilters.
+	lineRequirements []lineRequirement
+	decoded          bool // whether the parser is json or logfmt
+}
+
+func (h *labelFilterHints) ShouldContinueParsingLine(labelName string, lbs *LabelsBuilder) bool {
+	for i := 0; i < len(h.labelNames); i++ {
+		if h.labelNames[i] == labelName {
+			_, matches := h.labelFilters[i].Process(0, nil, lbs)
+			return matches
+		}
+	}
+	return true
+}
+
+func (h *labelFilterHints) ShouldParseLine(line []byte, lbs *LabelsBuilder) bool {
+	for _, r := range h.lineRequirements {
+		// labelSet comes first because it costs less than a search of the line.
+		if !r.labelSet(lbs) && !r.need.mayHold(line) {
+			// json and logfmt can decode a \u escape into any byte that a requirement needs.
+			return h.decoded && bytes.Contains(line, unicodeEscape)
+		}
+	}
+	return true
+}
+
+// NewLabelFilterHints scans stages for label filters so a parser can stop
+// extracting a line as soon as one of them fails to match a label it just extracted,
+// and can skip a line that cannot pass them without parsing it.
+//
+// The optimization works only with a single parser in the pipeline. With multiple parser
+// there is potentially an optimization here but this should rarely happen and would complicate
+// the below logic.
+//
+// If there is exactly one parser than the optimization can be applied to any label filter after the parser
+// and before any stage that modifies labels. If there is a single label filter before the parser it also
+// cannot be applied b/c the optimization is order independent.
+//
+// See TestNewLabelFilterHints_Boundary for the full list of supported and unsupported shapes, and
+// appendLineRequirements for the filters that let a parser skip a line.
+func NewLabelFilterHints(stages Stages) LabelFilterHints {
+	var labelNames []string
+	var labelFilters []LabelFilterer
+	var lineRequirements []lineRequirement
+
+	isParser := func(s Stage) bool {
+		switch s.(type) {
+		case *JSONParser, *LogfmtParser, *RegexpParser, *UnpackParser, *PatternParser, *LogfmtExpressionParser, *JSONExpressionParser:
+			return true
+		case *DropLabels, *KeepLabels, *LineFormatter, *LabelsFormatter, *Decolorizer,
+			*IPLineFilter, *IPLabelFilter,
+			*BinaryLabelFilter, *NoopLabelFilter, *BytesLabelFilter, *DurationLabelFilter,
+			*NumericLabelFilter, *StringLabelFilter, *LineFilterLabelFilter,
+			*noopStage, StageFunc:
+			return false
+		default:
+			// Fail loudly so a new Stage implementation is categorized explicitly.
+			panic(fmt.Sprintf("NewLabelFilterHints: unhandled stage type %T, add it to the isParser switch", s))
+		}
+	}
+
+	addIfLabelFilterer := func(s Stage) {
+		f, ok := s.(LabelFilterer)
+		if !ok {
+			return
+		}
+		requiredNames := f.RequiredLabelNames()
+		if len(requiredNames) > 1 || len(requiredNames) == 0 { // ShouldContinueParsing is only able to evaluate one label at a time so we have to exclude any filter operating on multiple
+			return
+		}
+		labelFilters = append(labelFilters, f)
+		labelNames = append(labelNames, requiredNames[0])
+	}
+
+	parserCount := 0
+	parserIdx := -1
+	for i, s := range stages {
+		if isParser(s) {
+			parserIdx = i
+			parserCount++
+		}
+	}
+	if parserCount != 1 {
+		return NoLabelFilterHints()
+	}
+
+	var guaranteed [][]byte
+	for _, s := range stages[:parserIdx] {
+		if s.Hints().CanModifyLine {
+			guaranteed = nil
+		}
+		if f, ok := s.(StageFunc); ok {
+			guaranteed = appendLineFilterLiterals(guaranteed, f.lineFilter)
+		}
+	}
+
+	values := parserValuesOf(stages[parserIdx])
+	for i := parserIdx + 1; i < len(stages); i++ {
+		s := stages[i]
+
+		addIfLabelFilterer(s)
+		if f, ok := s.(LabelFilterer); ok {
+			lineRequirements = appendLineRequirements(lineRequirements, f, values, guaranteed)
+		}
+
+		// we found a stage that modifies labels, all future filters are not eligible for the optimization
+		// since ShouldContinueParsingLine is order independent
+		if s.Hints().CanModifyLabels {
+			break
+		}
+	}
+
+	lineRequirements = withinBudget(lineRequirements)
+	if len(labelNames) == 0 && len(lineRequirements) == 0 {
+		return NoLabelFilterHints()
+	}
+
+	return &labelFilterHints{labelFilters: labelFilters, labelNames: labelNames, lineRequirements: lineRequirements, decoded: values == valuesDecoded}
+}
